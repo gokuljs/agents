@@ -34,7 +34,7 @@ class AvailabilityChangedEvent:
 @dataclass
 class _STTStatus:
     available: bool
-    recovering_synthesize_task: asyncio.Task[None] | None
+    recovering_recognize_task: asyncio.Task[None] | None
     recovering_stream_task: asyncio.Task[None] | None
 
 
@@ -84,7 +84,7 @@ class FallbackAdapter(
         self._status: list[_STTStatus] = [
             _STTStatus(
                 available=True,
-                recovering_synthesize_task=None,
+                recovering_recognize_task=None,
                 recovering_stream_task=None,
             )
             for _ in self._stt_instances
@@ -171,8 +171,8 @@ class FallbackAdapter(
     ) -> None:
         stt_status = self._status[self._stt_instances.index(stt)]
         if (
-            stt_status.recovering_synthesize_task is None
-            or stt_status.recovering_synthesize_task.done()
+            stt_status.recovering_recognize_task is None
+            or stt_status.recovering_recognize_task.done()
         ):
 
             async def _recover_stt_task(stt: STT) -> None:
@@ -194,7 +194,7 @@ class FallbackAdapter(
                 except Exception:
                     return
 
-            stt_status.recovering_synthesize_task = asyncio.create_task(_recover_stt_task(stt))
+            stt_status.recovering_recognize_task = asyncio.create_task(_recover_stt_task(stt))
 
     async def _recognize_impl(
         self,
@@ -253,8 +253,8 @@ class FallbackAdapter(
 
     async def aclose(self) -> None:
         for stt_status in self._status:
-            if stt_status.recovering_synthesize_task is not None:
-                await aio.cancel_and_wait(stt_status.recovering_synthesize_task)
+            if stt_status.recovering_recognize_task is not None:
+                await aio.cancel_and_wait(stt_status.recovering_recognize_task)
 
             if stt_status.recovering_stream_task is not None:
                 await aio.cancel_and_wait(stt_status.recovering_stream_task)
@@ -329,71 +329,76 @@ class FallbackRecognizeStream(RecognizeStream):
                 except Exception:
                     logger.exception("error happened in forwarding input", extra={"streamed": True})
 
+            with contextlib.suppress(RuntimeError):
+                for stream in self._recovering_streams:
+                    stream.end_input()
+
             if main_stream is not None:
                 with contextlib.suppress(RuntimeError):
                     main_stream.end_input()
 
-        for i, stt in enumerate(self._fallback_adapter._stt_instances):
-            stt_status = self._fallback_adapter._status[i]
-            if stt_status.available or all_failed:
-                try:
-                    main_stream = stt.stream(
-                        language=self._language,
-                        conn_options=dataclasses.replace(
-                            self._conn_options,
-                            max_retry=self._fallback_adapter._max_retry_per_stt,
-                            timeout=self._fallback_adapter._attempt_timeout,
-                            retry_interval=self._fallback_adapter._retry_interval,
-                        ),
-                    )
-
-                    if forward_input_task is None or forward_input_task.done():
-                        forward_input_task = asyncio.create_task(_forward_input_task())
-
+        try:
+            for i, stt in enumerate(self._fallback_adapter._stt_instances):
+                stt_status = self._fallback_adapter._status[i]
+                if stt_status.available or all_failed:
                     try:
-                        async with main_stream:
-                            async for ev in main_stream:
-                                self._event_ch.send_nowait(ev)
+                        main_stream = stt.stream(
+                            language=self._language,
+                            conn_options=dataclasses.replace(
+                                self._conn_options,
+                                max_retry=self._fallback_adapter._max_retry_per_stt,
+                                timeout=self._fallback_adapter._attempt_timeout,
+                                retry_interval=self._fallback_adapter._retry_interval,
+                            ),
+                        )
 
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            f"{stt.label} timed out, switching to next STT",
-                            extra={"streamed": True},
-                        )
-                        raise
-                    except APIError as e:
-                        logger.warning(
-                            f"{stt.label} failed, switching to next STT",
-                            exc_info=e,
-                            extra={"streamed": True},
-                        )
-                        raise
+                        if forward_input_task is None or forward_input_task.done():
+                            forward_input_task = asyncio.create_task(_forward_input_task())
+
+                        try:
+                            async with main_stream:
+                                async for ev in main_stream:
+                                    self._event_ch.send_nowait(ev)
+
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                f"{stt.label} timed out, switching to next STT",
+                                extra={"streamed": True},
+                            )
+                            raise
+                        except APIError as e:
+                            logger.warning(
+                                f"{stt.label} failed, switching to next STT",
+                                exc_info=e,
+                                extra={"streamed": True},
+                            )
+                            raise
+                        except Exception:
+                            logger.exception(
+                                f"{stt.label} unexpected error, switching to next STT",
+                                extra={"streamed": True},
+                            )
+                            raise
+
+                        return
                     except Exception:
-                        logger.exception(
-                            f"{stt.label} unexpected error, switching to next STT",
-                            extra={"streamed": True},
-                        )
-                        raise
+                        if stt_status.available:
+                            stt_status.available = False
+                            self._stt.emit(
+                                "stt_availability_changed",
+                                AvailabilityChangedEvent(stt=stt, available=False),
+                            )
 
-                    return
-                except Exception:
-                    if stt_status.available:
-                        stt_status.available = False
-                        self._stt.emit(
-                            "stt_availability_changed",
-                            AvailabilityChangedEvent(stt=stt, available=False),
-                        )
+                self._try_recovery(stt)
 
-            self._try_recovery(stt)
+            raise APIConnectionError(
+                f"all STTs failed ({[stt.label for stt in self._fallback_adapter._stt_instances]}) after {time.time() - start_time} seconds"  # noqa: E501
+            )
+        finally:
+            if forward_input_task is not None:
+                await aio.cancel_and_wait(forward_input_task)
 
-        if forward_input_task is not None:
-            await aio.cancel_and_wait(forward_input_task)
-
-        await asyncio.gather(*[stream.aclose() for stream in self._recovering_streams])
-
-        raise APIConnectionError(
-            f"all STTs failed ({[stt.label for stt in self._fallback_adapter._stt_instances]}) after {time.time() - start_time} seconds"  # noqa: E501
-        )
+            await asyncio.gather(*[stream.aclose() for stream in self._recovering_streams])
 
     def _try_recovery(self, stt: STT) -> None:
         stt_status = self._fallback_adapter._status[
@@ -415,7 +420,7 @@ class FallbackRecognizeStream(RecognizeStream):
                     nb_transcript = 0
                     async with stream:
                         async for ev in stream:
-                            if ev.type in SpeechEventType.FINAL_TRANSCRIPT:
+                            if ev.type == SpeechEventType.FINAL_TRANSCRIPT:
                                 if not ev.alternatives or not ev.alternatives[0].text:
                                     continue
 
@@ -426,7 +431,7 @@ class FallbackRecognizeStream(RecognizeStream):
                         return
 
                     stt_status.available = True
-                    logger.info(f"tts.FallbackAdapter, {stt.label} recovered")
+                    logger.info(f"stt.FallbackAdapter, {stt.label} recovered")
                     self._fallback_adapter.emit(
                         "stt_availability_changed",
                         AvailabilityChangedEvent(stt=stt, available=True),
@@ -434,18 +439,18 @@ class FallbackRecognizeStream(RecognizeStream):
 
                 except asyncio.TimeoutError:
                     logger.warning(
-                        f"{stream._stt.label} recovery timed out",
+                        f"{stt.label} recovery timed out",
                         extra={"streamed": True},
                     )
                 except APIError as e:
                     logger.warning(
-                        f"{stream._stt.label} recovery failed",
+                        f"{stt.label} recovery failed",
                         exc_info=e,
                         extra={"streamed": True},
                     )
                 except Exception:
                     logger.exception(
-                        f"{stream._stt.label} recovery unexpected error",
+                        f"{stt.label} recovery unexpected error",
                         extra={"streamed": True},
                     )
                     raise
